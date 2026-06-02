@@ -1,0 +1,307 @@
+
+
+# network layer : create a lan network between all service
+networks: 
+  crypto-net:
+    driver: bridge  # connect all container within the same host
+    
+
+# volumes: virtual disk will be stored in host machine    
+# volumes will serve as the persistend storage for the container. 
+volumes: 
+  zookeeper-data:
+  zookeeper-log:
+  kafka-data:
+  kafka-log:
+  minio-data:
+  cassandra-data:
+  prometheus-data:
+  grafana-data:
+  grafana-log:  
+  spark-checkpoint:
+  n8n-data:
+
+# build services of system 
+services:  
+    # if u want run kafka server -> before that u need run zookeeper server
+    zookeeper:
+      image: confluentinc/cp-zookeeper:7.5.0  # install from docker hub (like app store)
+      container_name: zookeeper   # container's name in docker
+      hostname: zookeeper   # container's hostname (inside kafka can see zookeeper by this name)
+      networks: [crypto-net]  # connect to the lan network
+      # env variable  
+      environment: 
+        ZOOKEEPER_CLIENT_PORT: 2181 # zookeeper default client port
+        ZOOKEEPER_TICK_TIME: 2000 # this is the basic unit of time in zookeeper, it is used to measure the heartbeat interval between zookeeper nodes.
+        ZOOKEEPER_DATA_DIR: /data # directory where zookeeper will store its data
+        ZOOKEEPER_DATA_LOG_DIR: /datalog # directory where zookeeper will store its logs
+      volumes: 
+        - zookeeper-data:/data
+        - zookeeper-log:/datalog 
+      healthcheck: 
+        test: [CMD, "nc", "-z", "localhost", "2181"]
+        interval: 10s  # test every 10 seconds
+        timeout: 5s # max time to test
+        retries: 5 
+    
+    kafka: 
+      image: confluentinc/cp-kafka:7.5.0 
+      container_name: kafka
+      hostname: kafka
+      user: root   # fix AccessDeniedException on /var/lib/kafka/log
+      networks: [crypto-net]
+      depends_on: # zookeeper must be healthy before starting kafka 
+        zookeeper:
+          condition: service_healthy
+      ports: # machine-container
+        - "9092:9092" # map kafka broker port 9092 to host machine port 9092
+        - "9101:9101" # JMX for prometheus
+      environment: 
+        KAFKA_BROKER_ID: 1
+        KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181" # hostname:port (becasuse inside kafka can see zookeeper by hostname "zookeeper")
+        KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+        KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+        KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+        KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+        KAFKA_LOG_RETENTION_HOURS: 168       # 7 ngày retention
+        KAFKA_LOG_SEGMENT_BYTES: 1073741824
+        KAFKA_NUM_PARTITIONS: 3
+        KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+        KAFKA_JMX_PORT: 9101
+        KAFKA_JMX_HOSTNAME: kafka
+        KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+        KAFKA_LOG_DIRS: "/var/lib/kafka/log"
+      volumes: 
+        - kafka-data:/var/lib/kafka/data
+        - kafka-log:/var/lib/kafka/log
+      healthcheck: 
+        test: [CMD, "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]  # run cmd command to check kafka broker api versions
+        interval: 15s  # test every 15 seconds
+        timeout: 10s # max time to test
+        retries: 10 # max retries to test
+        start_period: 90s # wait 90s before first test
+    
+    kafka-ui: 
+      image: provectuslabs/kafka-ui:latest 
+      container_name: kafka-ui
+      networks: [crypto-net]
+      depends_on:
+        kafka: 
+          condition:  service_healthy
+      ports: 
+        - "8080:8080" # map kafka-ui port 8080 to host machine port 8080
+      environment: 
+        KAFKA_CLUSTERS_0_NAME: crypto-cluster
+        KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+    
+    schema-registry: # store and manage schemas of messages in kafka topic, change format of data , help producers and consumers to validate data
+      image: confluentinc/cp-schema-registry:7.5.0
+      container_name: schema-registry
+      hostname: schema-registry
+      networks: [crypto-net]
+      depends_on:
+        kafka:
+          condition: service_healthy
+      ports:
+        - "8081:8081" # map schema-registry port 8081 to host machine port 8081
+      environment: 
+        SCHEMA_REGISTRY_HOST_NAME: schema-registry
+        SCHEMA_REGISTRY_LISTENERS: http://schema-registry:8081  # schema registry will listen on port 8081 inside the container, and port 8081 on the host machine
+        SCHEMA_REGISTRY_KAFKA_BOOTSTRAP_SERVERS: kafka:29092  # kafka:29092 is the internal hostname:port of kafka
+        # Schema registry server is responsable for managing the schemas of the messages that are sent to and received from Kafka.
+
+
+#------------- Layer2 : Cold Storage (Bzone layer)-------------------------
+
+    minio: # cold storage server 
+      image: minio/minio:latest
+      container_name: crypto-minio
+      hostname: minio
+      networks: [crypto-net]
+      ports:
+        - "9000:9000" # spark coonect to port 9000
+        - "9001:9001" # mini console -> browser access 
+      environment:
+        MINIO_ROOT_USER: minioadmin
+        MINIO_ROOT_PASSWORD: minioadmin123
+      command: server /data --console-address ":9001"
+      volumes:
+        - minio-data:/data
+      healthcheck: 
+        test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+
+    minio-init:
+      image: minio/mc:latest # use minio client 
+      container_name: crypto-minio-init
+      networks: [crypto-net]
+      depends_on:
+        minio: 
+          condition: service_healthy
+      entrypoint: >
+        /bin/sh -c "
+          mc alias set local http://minio:9000 minioadmin minioadmin123;
+          mc mb --ignore-existing local/crypto-bronze;
+          mc mb --ignore-existing local/crypto-silver;
+          mc mb --ignore-existing local/crypto-checkpoints;
+          echo 'MinIO buckets initialized';
+        "
+
+#--------------Layer3: Hot Storage (silver, gold)-------------------------
+
+    cassandra: 
+      image: cassandra:4.1 
+      container_name: crypto-cassandra
+      hostname: cassandra 
+      networks: [crypto-net] 
+      ports: 
+        - "9042:9042"
+      environment:
+        CASSANDRA_CLUSTER_NAME: CryptoCluster
+        CASSANDRA_DC: datacenter1
+        CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+        MAX_HEAP_SIZE: 512M
+        HEAP_NEWSIZE: 128M  
+      volumes:
+        - cassandra-data:/var/lib/cassandra
+        - ./storage/cassandra-init.cql:/docker-entrypoint-initdb.d/init.cql:ro
+          # đưa cassandra-init.cql vào folder docker-entrypoint-initdb.d trong docker image cassandra -> named to init.cql
+      healthcheck:
+        test: ["CMD", "cqlsh", "-e", "DESCRIBE keyspaces"]
+        interval: 30s
+        timeout: 10s
+        retries: 10
+        start_period: 90s 
+
+#-------------Layer4: Processing Engine (spark) -----------------------
+
+    spark-master:
+      image: bitnamilegacy/spark:3.5.0
+      container_name: crypto-spark-master
+      hostname: spark-master
+      networks: [crypto-net]
+      ports:
+        - "7077:7077"
+        - "8090:8080"  # Spark Master UI
+      environment:
+        SPARK_MODE: master
+        SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+        SPARK_RPC_ENCRYPTION_ENABLED: "no"
+        SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: "no"
+        SPARK_SSL_ENABLED: "no"
+      volumes:
+        - ./processing:/opt/bitnami/spark/jobs
+        - spark-checkpoint:/opt/spark-checkpoints
+
+    spark-worker:
+      image: bitnamilegacy/spark:3.5.0
+      container_name: crypto-spark-worker
+      hostname: spark-worker
+      networks: [crypto-net]
+      depends_on: [spark-master]
+      ports:
+        - "8091:8081"  # Worker UI
+      environment:
+        SPARK_MODE: worker
+        SPARK_MASTER_URL: spark://spark-master:7077
+        SPARK_WORKER_MEMORY: 2G
+        SPARK_WORKER_CORES: 2
+        SPARK_RPC_AUTHENTICATION_ENABLED: "no"
+        SPARK_RPC_ENCRYPTION_ENABLED: "no"
+      volumes:
+        - ./processing:/opt/bitnami/spark/jobs
+        - spark-checkpoint:/opt/spark-checkpoints
+
+    spark-streaming-job:
+      image: bitnamilegacy/spark:3.5.0
+      container_name: crypto-spark-streaming
+      networks: [crypto-net]
+      depends_on:
+        spark-master:
+          condition: service_started
+        kafka:
+          condition: service_healthy
+        cassandra:
+          condition: service_healthy
+      volumes:
+        - ./processing:/opt/bitnami/spark/jobs
+        - spark-checkpoint:/opt/spark-checkpoints
+      command: >
+        spark-submit 
+        --master spark://spark-master:7077 
+        --packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.0,com.datastax.spark:spark-cassandra-connector_2.12:3.5.0 
+        /opt/bitnami/spark/jobs/spark_streaming.py
+      restart: unless-stopped
+    
+#------------Layer5: Data Ingestion (Producer.py) -------------------
+
+    producer:
+      build:
+        context: ./ingestion
+        dockerfile: Dockerfile
+      container_name: crypto-producer
+      hostname: producer
+      networks: [crypto-net]
+      depends_on:
+        kafka:
+          condition: service_healthy
+      environment:
+        KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+        KAFKA_TOPIC_TRADES: crypto_trades
+        KAFKA_TOPIC_DLQ: crypto_trades_dlq
+        SYMBOL: btcusdt
+        LOG_LEVEL: INFO
+      restart: unless-stopped
+
+#------------Layer6: Monitoring (Prometheus & Grafana) --------------
+    prometheus:
+      image: prom/prometheus:latest
+      container_name: crypto-prometheus
+      networks: [crypto-net]
+      ports:
+        - "9090:9090"
+      volumes:
+        - ./infrastructure/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+        - prometheus-data:/prometheus
+      command:
+        - "--config.file=/etc/prometheus/prometheus.yml"
+        - "--storage.tsdb.path=/prometheus"
+        - "--storage.tsdb.retention.time=15d"
+        - "--web.enable-lifecycle"
+
+    grafana:
+      image: grafana/grafana:10.2.0
+      container_name: crypto-grafana
+      networks: [crypto-net]
+      depends_on: [prometheus, cassandra]
+      ports:
+        - "3000:3000"
+      environment:
+        GF_SECURITY_ADMIN_USER: admin
+        GF_SECURITY_ADMIN_PASSWORD: crypto2024
+        GF_INSTALL_PLUGINS: hadesarchitect-cassandra-datasource
+        GF_FEATURE_TOGGLES_ENABLE: alertingSimplifiedRouting
+      volumes:
+        - grafana-data:/var/lib/grafana
+        - ./serving/grafana/provisioning:/etc/grafana/provisioning:ro
+        - ./serving/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+#------------Layer7: Automation & Alert ----------------------
+
+    n8n:
+      image: n8nio/n8n:latest
+      container_name: crypto-n8n
+      networks: [crypto-net]
+      ports:
+        - "5678:5678"
+      environment:
+        N8N_BASIC_AUTH_ACTIVE: "true"
+        N8N_BASIC_AUTH_USER: admin
+        N8N_BASIC_AUTH_PASSWORD: crypto2024
+        WEBHOOK_URL: http://n8n:5678
+        GENERIC_TIMEZONE: Asia/Ho_Chi_Minh
+      volumes:
+        - n8n-data:/home/node/.n8n
+

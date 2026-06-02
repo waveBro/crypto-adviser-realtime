@@ -1,0 +1,71 @@
+# =================================================================
+# Prometheus Configuration
+# Scrapes: Kafka JMX, Spark, Producer (custom metrics), Cassandra
+# =================================================================
+
+global: 
+    scrape_interval:     15s
+    evaluation_interval: 15s
+    external_labels:
+      environment: 'crypto-advisor'
+      datacenter:  'local'
+      
+# --- Alerting rules ---
+#rule_files: # declare keyword
+#  - "/etc/prometheus/alert_rules.yml"
+
+# ── Scrape Targets ────────────────────────────────────────────────
+scrape_configs:
+  
+  #Prometheus self-monitoring
+  - job_name: 'prometheus'
+    static_configs: 
+      - targets: ['localhost:9090']
+
+  #Kafka JMX Export
+  - job_name: 'kafka'
+    static_configs:
+      - targets: ['kafka:9101'] # port 9101 của JMX mở ra dể prometheus có thể láy metric 
+      # prometheus access đến kafka:9101/metrics để lấy thông tin của kafka
+    metrics_path: '/metrics' # http://kafka:9101/metrics.
+    scrape_interval: 30s
+
+  # Spark master
+  - job_name: 'spark'
+    static_configs:
+      - targets: ['spark-master:8080']
+    metrics_path: '/metrics/master/prometheus'
+    scrape_interval: 30s
+    
+  #Spark worker
+  - job_name: 'spark-worker'
+    static_configs:
+      - targets: ['spark-worker:8081']
+    metrics_path: '/metrics/prometheus'
+    scrape_interval: 30s
+
+  # Custom Producer metrics (prometheus-client)
+  - job_name: 'crypto-producer'
+    static_configs:
+      - targets: ['producer:8000']
+    scrape_interval: 10s
+
+  # MinIO metrics
+  - job_name: 'minio'
+    static_configs:
+      - targets: ['minio:9000']
+    metrics_path: /minio/v2/metrics/cluster
+    scrape_interval: 30s
+
+  # Cassandra JMX Exporter
+  - job_name: 'cassandra'
+    static_configs:
+      - targets: ['cassandra:7070']
+    metrics_path: '/metrics'
+    scrape_interval: 30s
+
+#các scape_config -> đều có:
+#+job_name: tên job
+#+ static_config : đia chỉ của hệ thống promethues connect đến
+#+ metric_paths : link các hệ thống tạo -> prometheus có thể connect và lấy metrics
+#+ scrape_interval : thời gian 

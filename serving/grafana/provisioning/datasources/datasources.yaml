@@ -1,0 +1,28 @@
+apiVersion: 1
+
+datasources:
+  # ── Cassandra (Silver/Gold data) ──────────────────────────────────
+  - name: Cassandra
+    type: hadesarchitect-cassandra-datasource
+    access: proxy
+    uid: cassandra-ds
+    jsonData:
+      host: cassandra
+      port: 9042
+      keyspace: crypto_advisor
+      consistency: LOCAL_QUORUM
+      timeout: 10
+    isDefault: false
+    editable: false
+
+  # ── Prometheus (System metrics) ───────────────────────────────────
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    uid: prometheus-ds
+    url: http://prometheus:9090
+    jsonData:
+      httpMethod: POST
+      exemplarTraceIdDestinations: []
+    isDefault: true
+    editable: false
